@@ -59,8 +59,6 @@ updateOnlineCount();
 // ---------- Upload handling ----------
 const dropzone = $('#dropzone');
 const fileInput = $('#fileInput');
-
-// NEW: explicit “Select Files” button support
 const uploadBtn = document.getElementById('uploadBtn');
 if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput.click());
 
@@ -121,7 +119,16 @@ async function uploadFile(file) {
   const { data: pub } = supabase.storage.from('uploads').getPublicUrl(path);
   const downloadURL = pub.publicUrl;
 
-  const duration = await calcDurationFromURL(downloadURL).catch(() => 0);
+  // 🔧 FIX: wait & retry for duration to avoid 0:00 bug
+  await new Promise((res) => setTimeout(res, 500));
+  let duration = 0;
+  for (let attempt = 0; attempt < 2 && duration === 0; attempt++) {
+    try {
+      duration = await calcDurationFromURL(downloadURL);
+    } catch {
+      await new Promise((res) => setTimeout(res, 500));
+    }
+  }
 
   const title = sanitizeTitle(file.name);
   const { error: dberr } = await supabase.from('tracks').insert({
@@ -140,8 +147,7 @@ async function uploadFile(file) {
   row.querySelector('.status').textContent = 'Done';
   toast('Uploaded: ' + file.name);
 
-  // Force-refresh library after upload
-  await initialLoad();
+  await initialLoad(); // Refresh library after upload
 }
 
 function calcDurationFromURL(url) {
@@ -167,8 +173,6 @@ async function initialLoad() {
   }
 }
 await initialLoad();
-
-// Poll every 5 seconds for new data
 setInterval(initialLoad, 5000);
 
 $('#sortSelect').addEventListener('change', applySearchAndSort);
