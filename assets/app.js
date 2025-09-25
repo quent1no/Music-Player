@@ -16,7 +16,7 @@ let currentIndex = -1;
 let shuffle = JSON.parse(localStorage.getItem('smp_shuffle') || 'false');
 let repeat = JSON.parse(localStorage.getItem('smp_repeat') || 'false');
 let volume = Number(localStorage.getItem('smp_volume') || '0.9');
-let followSync = JSON.parse(localStorage.getItem('smp_sync') || 'false');
+let followSync = true; // Always ON
 
 $('#volume').value = volume;
 audio.volume = volume;
@@ -119,15 +119,12 @@ async function uploadFile(file) {
   const { data: pub } = supabase.storage.from('uploads').getPublicUrl(path);
   const downloadURL = pub.publicUrl;
 
-  // 🔧 FIX: wait & retry for duration to avoid 0:00 bug
+  // Wait & retry to get accurate duration
   await new Promise((res) => setTimeout(res, 500));
   let duration = 0;
   for (let attempt = 0; attempt < 2 && duration === 0; attempt++) {
-    try {
-      duration = await calcDurationFromURL(downloadURL);
-    } catch {
-      await new Promise((res) => setTimeout(res, 500));
-    }
+    try { duration = await calcDurationFromURL(downloadURL); }
+    catch { await new Promise((res) => setTimeout(res, 500)); }
   }
 
   const title = sanitizeTitle(file.name);
@@ -147,7 +144,7 @@ async function uploadFile(file) {
   row.querySelector('.status').textContent = 'Done';
   toast('Uploaded: ' + file.name);
 
-  await initialLoad(); // Refresh library after upload
+  await initialLoad();
 }
 
 function calcDurationFromURL(url) {
@@ -250,20 +247,13 @@ function saveQueue() {
 }
 loadQueue();
 
-function trackById(id) {
-  return library.find((t) => t.id === id);
-}
+function trackById(id) { return library.find((t) => t.id === id); }
 
 function playFromLibrary(track) {
   const ids = filtered.map((t) => t.id);
   const idx = ids.indexOf(track.id);
-  if (shuffle) {
-    queue = shuffleArray(ids);
-    currentIndex = queue.indexOf(track.id);
-  } else {
-    queue = ids;
-    currentIndex = idx;
-  }
+  if (shuffle) { queue = shuffleArray(ids); currentIndex = queue.indexOf(track.id); }
+  else { queue = ids; currentIndex = idx; }
   startPlayback(track);
   saveQueue();
 }
@@ -276,6 +266,7 @@ function startPlayback(track) {
   nowArtist.textContent = track.artist || '';
   timeTotal.textContent = formatTime(track.duration || 0);
   setPlayPauseIcon('pause');
+  pushSyncStateSoon();
 }
 
 function setPlayPauseIcon(state) {
@@ -289,22 +280,15 @@ function setPlayPauseIcon(state) {
 
 function next() {
   if (!queue.length) return;
-  if (repeat) {
-    // replay same track
-  } else if (shuffle) {
-    currentIndex = Math.floor(Math.random() * queue.length);
-  } else {
-    currentIndex = (currentIndex + 1) % queue.length;
-  }
+  if (repeat) { /* replay same */ }
+  else if (shuffle) { currentIndex = Math.floor(Math.random() * queue.length); }
+  else { currentIndex = (currentIndex + 1) % queue.length; }
   startPlayback(trackById(queue[currentIndex]));
   saveQueue();
 }
 function prev() {
   if (!queue.length) return;
-  if (audio.currentTime > 3) {
-    audio.currentTime = 0;
-    return;
-  }
+  if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   if (shuffle) currentIndex = Math.floor(Math.random() * queue.length);
   else currentIndex = (currentIndex - 1 + queue.length) % queue.length;
   startPlayback(trackById(queue[currentIndex]));
@@ -312,24 +296,18 @@ function prev() {
 }
 
 playPauseBtn.addEventListener('click', () => {
-  if (audio.paused) {
-    audio.play();
-    setPlayPauseIcon('pause');
-  } else {
-    audio.pause();
-    setPlayPauseIcon('play');
-  }
+  if (audio.paused) { audio.play(); setPlayPauseIcon('pause'); }
+  else { audio.pause(); setPlayPauseIcon('play'); }
+  pushSyncStateSoon();
 });
 nextBtn.addEventListener('click', next);
 prevBtn.addEventListener('click', prev);
 shuffleBtn.addEventListener('click', () => {
-  shuffle = !shuffle;
-  localStorage.setItem('smp_shuffle', JSON.stringify(shuffle));
+  shuffle = !shuffle; localStorage.setItem('smp_shuffle', JSON.stringify(shuffle));
   toast('Shuffle ' + (shuffle ? 'on' : 'off'));
 });
 repeatBtn.addEventListener('click', () => {
-  repeat = !repeat;
-  localStorage.setItem('smp_repeat', JSON.stringify(repeat));
+  repeat = !repeat; localStorage.setItem('smp_repeat', JSON.stringify(repeat));
   toast('Repeat ' + (repeat ? 'on' : 'off'));
 });
 volumeSlider.addEventListener('input', (e) => {
@@ -339,36 +317,97 @@ volumeSlider.addEventListener('input', (e) => {
 
 seek.addEventListener('input', () => {
   if (audio.duration) audio.currentTime = (seek.value / 100) * audio.duration;
+  pushSyncStateSoon();
 });
 
 audio.addEventListener('timeupdate', () => {
   if (!audio.duration) return;
   seek.value = String((audio.currentTime / audio.duration) * 100);
   timeCur.textContent = formatTime(audio.currentTime);
+  if (!audio.paused) throttledPush();
 });
 audio.addEventListener('ended', () => {
-  if (repeat) {
-    audio.currentTime = 0;
-    audio.play();
-  } else next();
+  if (repeat) { audio.currentTime = 0; audio.play(); }
+  else next();
 });
 
+// Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
-  if (e.code === 'Space') {
-    e.preventDefault();
-    playPauseBtn.click();
-  }
+  if (e.code === 'Space') { e.preventDefault(); playPauseBtn.click(); }
   if (e.key === 'j' || e.key === 'J') prev();
   if (e.key === 'k' || e.key === 'K') next();
 });
 
 function shuffleArray(arr) {
-  return arr
-    .map((v) => [Math.random(), v])
-    .sort((a, b) => a[0] - b[0])
-    .map((x) => x[1]);
+  return arr.map((v) => [Math.random(), v]).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
 }
+
+// ---------- Shared Sync ----------
+let suppressPushUntil = 0;
+
+async function pollState() {
+  if (!followSync) return;
+  const { data, error } = await supabase
+    .from('state')
+    .select('*')
+    .eq('id', 'global')
+    .maybeSingle();
+  if (error || !data) return;
+  applyRemoteState(data);
+}
+setInterval(pollState, 1000);
+pollState();
+
+try {
+  supabase
+    .channel('realtime:state')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'state', filter: 'id=eq.global' },
+      payload => { applyRemoteState(payload.new || payload.old || {}); })
+    .subscribe();
+} catch {}
+
+function applyRemoteState(s) {
+  suppressPushUntil = Date.now() + 1200;
+  const t = library.find(x => x.id === s.current_track_id);
+  if (t) {
+    if (!queue.length || queue[currentIndex] !== t.id) {
+      queue = [t.id]; currentIndex = 0; saveQueue(); startPlayback(t);
+    }
+    if (typeof s.position === 'number' && audio.duration) {
+      if (Math.abs((audio.currentTime || 0) - s.position) > 0.8) {
+        audio.currentTime = s.position;
+      }
+    }
+    if (s.is_playing && audio.paused) audio.play().catch(()=>{});
+    if (!s.is_playing && !audio.paused) audio.pause();
+  }
+}
+
+function nowState() {
+  return {
+    id: 'global',
+    current_track_id: queue[currentIndex] || null,
+    position: audio.currentTime || 0,
+    is_playing: !audio.paused,
+    updated_at: new Date(),
+  };
+}
+
+const pushSyncStateSoon = debounce(pushState, 300);
+let lastThrottled = 0;
+async function throttledPush() {
+  const now = Date.now();
+  if (now - lastThrottled > 2000) { lastThrottled = now; pushState(); }
+}
+
+async function pushState() {
+  if (!followSync) return;
+  if (Date.now() < suppressPushUntil) return;
+  await supabase.from('state').upsert(nowState());
+}
+
+function debounce(fn, ms) { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; }
 
 // ---------- Restore previous queue ----------
 (function () {
