@@ -17,10 +17,10 @@ let shuffle = JSON.parse(localStorage.getItem('smp_shuffle') || 'false');
 let repeat  = JSON.parse(localStorage.getItem('smp_repeat')  || 'false');
 let volume  = Number(localStorage.getItem('smp_volume')      || '0.9');
 
-let followSync = true;                // always ON
-let hostUid = null;                   // current host (from DB)
-let lastRemoteAt = 0;                 // ms timestamp of last applied remote
-let suppressPushUntil = 0;            // prevents ping-pong after applying remote
+let followSync = true;         // always ON
+let hostUid = null;            // current host (from DB)
+let lastRemoteAt = 0;          // ms timestamp of last applied remote
+let suppressPushUntil = 0;     // prevents ping-pong right after applying remote
 
 $('#volume').value = volume;
 audio.volume = volume;
@@ -66,30 +66,30 @@ const hostBtn   = $('#hostBtn');
 const hostBadge = $('#hostBadge');
 
 hostBtn.addEventListener('click', async () => {
-  await becomeHost();
+  if (hostUid === me.id) {
+    await releaseHost();
+  } else {
+    await becomeHost();
+  }
 });
 
 function updateHostUI() {
   const isHost = hostUid === me.id;
-  if (isHost) {
-    hostBtn.textContent = 'Release host';
-    hostBtn.onclick = async () => { await releaseHost(); };
+  hostBtn.textContent = isHost ? 'Release host' : 'Become host';
+  if (hostUid) {
     hostBadge.classList.remove('hidden');
-    hostBadge.textContent = `Host: ${shortAnon(me.id)}`;
-    hostBadge.classList.add('border-emerald-500');
+    hostBadge.textContent = `Host: ${shortAnon(hostUid)}`;
   } else {
-    hostBtn.textContent = 'Become host';
-    hostBtn.onclick = async () => { await becomeHost(); };
-    hostBadge.classList.toggle('hidden', !hostUid);
-    if (hostUid) {
-      hostBadge.textContent = `Host: ${shortAnon(hostUid)}`;
-      hostBadge.classList.add('border-emerald-500');
-    }
+    hostBadge.classList.add('hidden');
+    hostBadge.textContent = 'Host: —';
   }
 }
 
 async function becomeHost() {
-  // Host takes over and writes the current state
+  // set local first to avoid race window
+  hostUid = me.id;
+  updateHostUI();
+
   await supabase.from('state').upsert({
     id: 'global',
     host_uid: me.id,
@@ -99,13 +99,12 @@ async function becomeHost() {
     updated_at: new Date(),
     updated_by: me.id,
   });
-  hostUid = me.id;
-  updateHostUI();
   toast('You are now the host.');
 }
 
 async function releaseHost() {
-  await supabase.from('state').upsert({
+  // do not clear local first; only after DB success
+  const { error } = await supabase.from('state').upsert({
     id: 'global',
     host_uid: null,
     current_track_id: queue[currentIndex] || null,
@@ -114,9 +113,11 @@ async function releaseHost() {
     updated_at: new Date(),
     updated_by: me.id,
   });
-  hostUid = null;
-  updateHostUI();
-  toast('Host released.');
+  if (!error) {
+    hostUid = null;
+    updateHostUI();
+    toast('Host released.');
+  }
 }
 
 // ---------- Upload handling ----------
@@ -391,7 +392,7 @@ document.addEventListener('keydown', (e) => {
 
 function shuffleArray(arr) { return arr.map((v) => [Math.random(), v]).sort((a, b) => a[0]-b[0]).map((x)=>x[1]); }
 
-// ---------- Shared Sync with Host Lock ----------
+// ---------- Shared Sync with strict Host Lock ----------
 async function pollState() {
   if (!followSync) return;
   const { data, error } = await supabase.from('state').select('*').eq('id', 'global').maybeSingle();
@@ -411,24 +412,23 @@ try {
 } catch {}
 
 function applyRemoteState(s) {
-  // Update host first
+  // 1) Update host from DB
   hostUid = s.host_uid ?? null;
   updateHostUI();
 
+  // 2) Ignore older states
   const ts = s.updated_at ? new Date(s.updated_at).getTime() : 0;
-  if (ts && ts <= lastRemoteAt) return; // old state
+  if (ts && ts <= lastRemoteAt) return;
   lastRemoteAt = ts || Date.now();
 
-  // If I'm host, ignore remote (I am source of truth)
+  // 3) If I'm host, ignore remote (my client is source of truth)
   if (hostUid === me.id) return;
 
-  // If no track selected yet
+  // 4) Follow host if a track is chosen
   if (!s.current_track_id) return;
-
   const t = library.find(x => x.id === s.current_track_id);
   if (!t) return;
 
-  // Follow track
   const differentTrack = !queue.length || queue[currentIndex] !== t.id;
   if (differentTrack) {
     queue = [t.id]; currentIndex = 0; saveQueue();
@@ -438,7 +438,6 @@ function applyRemoteState(s) {
     timeTotal.textContent = formatTime(t.duration || 0);
   }
 
-  // Follow position
   if (typeof s.position === 'number' && audio.duration) {
     if (Math.abs((audio.currentTime || 0) - s.position) > 0.8) {
       suppressPushUntil = Date.now() + 1200;
@@ -446,9 +445,7 @@ function applyRemoteState(s) {
     }
   }
 
-  // Follow play/pause
-  if (s.is_playing) { safePlay(); }
-  else { audio.pause(); }
+  if (s.is_playing) { safePlay(); } else { audio.pause(); }
 }
 
 function nowState() {
@@ -463,8 +460,7 @@ function nowState() {
   };
 }
 
-// Only the host is allowed to push when a host exists.
-// If no host yet, anyone can become source (until someone clicks "Become host").
+// 🛡️ Only host writes. Non-hosts NEVER write.
 const pushSyncStateSoon = debounce(pushState, 250);
 let lastThrottled = 0;
 async function throttledPush() {
@@ -474,13 +470,8 @@ async function throttledPush() {
 
 async function pushState() {
   if (!followSync) return;
-
-  // Respect host lock: if a host is set and it's not me, I do not write
-  if (hostUid && hostUid !== me.id) return;
-
-  // Avoid immediate push after applying remote
-  if (Date.now() < suppressPushUntil) return;
-
+  if (hostUid !== me.id) return;               // <--- key line: only host writes
+  if (Date.now() < suppressPushUntil) return;  // don't echo right after remote apply
   await supabase.from('state').upsert(nowState());
 }
 
