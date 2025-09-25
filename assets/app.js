@@ -189,6 +189,13 @@ async function uploadFile(file) {
   $('#uploadList').prepend(row);
   lucide.createIcons();
 
+  // --- NEW: get duration from local file first (robust, no CORS/race) ---
+  let duration = 0;
+  try {
+    duration = await calcDurationFromFile(file);
+  } catch { duration = 0; }
+
+  // Upload (path includes bucket 'uploads' implicitly via from('uploads'))
   const path = `uploads/${me.id}/${Date.now()}-${file.name}`;
   const { error } = await supabase.storage
     .from('uploads')
@@ -196,16 +203,9 @@ async function uploadFile(file) {
   if (error) throw error;
   row.querySelector('.progress').style.width = '70%';
 
+  // Public URL for playback
   const { data: pub } = supabase.storage.from('uploads').getPublicUrl(path);
   const downloadURL = pub.publicUrl;
-
-  // Wait & retry to get accurate duration (avoid 0:00)
-  await new Promise((res) => setTimeout(res, 500));
-  let duration = 0;
-  for (let attempt = 0; attempt < 2 && duration === 0; attempt++) {
-    try { duration = await calcDurationFromURL(downloadURL); }
-    catch { await new Promise((res) => setTimeout(res, 500)); }
-  }
 
   const title = sanitizeTitle(file.name);
   const { error: dberr } = await supabase.from('tracks').insert({
@@ -224,16 +224,56 @@ async function uploadFile(file) {
   row.querySelector('.status').textContent = 'Done';
   toast('Uploaded: ' + file.name);
 
-  await initialLoad();
+  await initialLoad();            // refresh list
+  await repairZeroDurations();    // just in case
 }
 
-function calcDurationFromURL(url) {
+// Duration helpers (robust)
+function calcDurationFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    sniffDuration(url)
+      .then((d) => { URL.revokeObjectURL(url); resolve(d); })
+      .catch((e) => { URL.revokeObjectURL(url); reject(e); });
+  });
+}
+
+function sniffDuration(src) {
   return new Promise((resolve, reject) => {
     const a = new Audio();
+    let done = false;
+    const timeout = setTimeout(() => {
+      if (!done) { done = true; reject(new Error('duration timeout')); }
+    }, 6000);
+
+    function clean(ok, val) {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      a.src = '';
+      ok ? resolve(Math.max(0, Math.round(val || 0))) : reject(val);
+    }
+
     a.preload = 'metadata';
-    a.src = url;
-    a.onloadedmetadata = () => resolve(Math.round(a.duration || 0));
-    a.onerror = () => reject(new Error('Failed to read audio duration'));
+    a.crossOrigin = 'anonymous';
+    a.src = src;
+
+    a.addEventListener('loadedmetadata', () => {
+      if (Number.isFinite(a.duration) && a.duration > 0) {
+        clean(true, a.duration);
+      } else {
+        const onTimeUpdate = () => {
+          if (Number.isFinite(a.duration) && a.duration > 0) {
+            a.removeEventListener('timeupdate', onTimeUpdate);
+            clean(true, a.duration);
+          }
+        };
+        a.addEventListener('timeupdate', onTimeUpdate);
+        try { a.currentTime = 1e7; } catch {}
+      }
+    });
+
+    a.addEventListener('error', () => clean(false, new Error('audio error')));
   });
 }
 
@@ -251,6 +291,9 @@ async function initialLoad() {
 }
 await initialLoad();
 setInterval(initialLoad, POLL_MS_TRACKS);
+
+// Try to repair any tracks that have duration == 0 on startup
+repairZeroDurations().catch(() => {});
 
 $('#sortSelect').addEventListener('change', applySearchAndSort);
 $('#search').addEventListener('input', applySearchAndSort);
@@ -500,6 +543,22 @@ async function pushState() {
 }
 
 function debounce(fn, ms) { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; }
+
+// ---------- Repair zero-duration tracks (for older rows) ----------
+async function repairZeroDurations() {
+  const broken = (library || []).filter(t => !t.duration || t.duration <= 0);
+  for (const t of broken) {
+    try {
+      const d = await sniffDuration(t.download_url);
+      if (d > 0) {
+        await supabase.from('tracks').update({ duration: d }).eq('id', t.id);
+        const idx = library.findIndex(x => x.id === t.id);
+        if (idx >= 0) library[idx].duration = d;
+      }
+    } catch { /* ignore */ }
+  }
+  applySearchAndSort();
+}
 
 // ---------- Restore previous queue UI ----------
 (function () {
