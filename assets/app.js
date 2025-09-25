@@ -59,8 +59,11 @@ updateOnlineCount();
 // ---------- Upload handling ----------
 const dropzone = $('#dropzone');
 const fileInput = $('#fileInput');
+
+// NEW: explicit “Select Files” button support
 const uploadBtn = document.getElementById('uploadBtn');
-uploadBtn.addEventListener('click', () => fileInput.click());
+if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput.click());
+
 dropzone.addEventListener('click', () => fileInput.click());
 ['dragenter', 'dragover'].forEach((ev) =>
   dropzone.addEventListener(ev, (e) => {
