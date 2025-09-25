@@ -20,7 +20,7 @@ let volume  = Number(localStorage.getItem('smp_volume')      || '0.9');
 let followSync = true;         // always ON
 let hostUid = null;            // current host (from DB)
 let lastRemoteAt = 0;          // ms timestamp of last applied remote
-let suppressPushUntil = 0;     // prevents ping-pong right after applying remote
+let suppressPushUntil = 0;     // prevents ping-pong immediately after applying remote
 
 $('#volume').value = volume;
 audio.volume = volume;
@@ -86,37 +86,46 @@ function updateHostUI() {
 }
 
 async function becomeHost() {
-  // set local first to avoid race window
+  // Take host locally first to avoid race flicker
   hostUid = me.id;
   updateHostUI();
+  // Ignore any older remote states during this brief window
+  lastRemoteAt = Date.now();
+  suppressPushUntil = Date.now() + 1500;
 
-  await supabase.from('state').upsert({
+  const { error } = await supabase.from('state').upsert({
     id: 'global',
     host_uid: me.id,
     current_track_id: queue[currentIndex] || null,
     position: audio.currentTime || 0,
     is_playing: !audio.paused,
-    updated_at: new Date(),
-    updated_by: me.id,
+    updated_at: new Date()
   });
-  toast('You are now the host.');
+  if (error) {
+    toast('Failed to become host', 'error');
+    // roll back if write failed
+    hostUid = null;
+    updateHostUI();
+  } else {
+    toast('You are now the host.');
+  }
 }
 
 async function releaseHost() {
-  // do not clear local first; only after DB success
   const { error } = await supabase.from('state').upsert({
     id: 'global',
     host_uid: null,
     current_track_id: queue[currentIndex] || null,
     position: audio.currentTime || 0,
     is_playing: !audio.paused,
-    updated_at: new Date(),
-    updated_by: me.id,
+    updated_at: new Date()
   });
   if (!error) {
     hostUid = null;
     updateHostUI();
     toast('Host released.');
+  } else {
+    toast('Failed to release host', 'error');
   }
 }
 
@@ -455,8 +464,7 @@ function nowState() {
     current_track_id: queue[currentIndex] || null,
     position: audio.currentTime || 0,
     is_playing: !audio.paused,
-    updated_at: new Date(),
-    updated_by: me.id,
+    updated_at: new Date()
   };
 }
 
@@ -470,7 +478,7 @@ async function throttledPush() {
 
 async function pushState() {
   if (!followSync) return;
-  if (hostUid !== me.id) return;               // <--- key line: only host writes
+  if (hostUid !== me.id) return;               // only host writes
   if (Date.now() < suppressPushUntil) return;  // don't echo right after remote apply
   await supabase.from('state').upsert(nowState());
 }
