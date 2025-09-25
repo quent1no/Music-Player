@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; }
+html { scroll-behavior: smooth; }
+.track-card .menu { display:none; }
+.track-card:focus-within .menu, .track-card .menuBtn:focus + .menu, .track-card .menuBtn:hover + .menu { display:block; }
+input[type="range"] { accent-color: #06b6d4; }
+.toast { position: fixed; right: 1rem; bottom: 4.5rem; z-index: 50; }
+.toast > div { animation: toast-in .2s ease-out; }
+@keyframes toast-in { from { transform: translateY(8px); opacity:0 } to { transform: translateY(0); opacity:1 } }
