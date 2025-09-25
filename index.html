@@ -1,573 +1,151 @@
-import { supabase, ensureAnonAuth, shortAnon } from './supabase.js';
-import { $, $$, toast, renderTrackCard, formatTime, sanitizeTitle } from './ui.js';
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shared Music Player</title>
+  <meta name="theme-color" content="#0ea5e9">
 
-// ---------- Config ----------
-const MAX_MB = 20;
-const MAX_BYTES = MAX_MB * 1024 * 1024;
-const POLL_MS_TRACKS = 5000;
-const POLL_MS_STATE = 1000;
-$('#maxSizeLabel').textContent = String(MAX_MB);
-
-// ---------- State ----------
-const audio = document.getElementById('audio');
-let library = [];
-let filtered = [];
-let queue = [];
-let currentIndex = -1;
-
-let shuffle = JSON.parse(localStorage.getItem('smp_shuffle') || 'false');
-let repeat  = JSON.parse(localStorage.getItem('smp_repeat')  || 'false');
-let volume  = Number(localStorage.getItem('smp_volume')      || '0.9');
-
-let followSync = true;         // always ON
-let hostUid = null;            // current host (from DB)
-let lastRemoteAt = 0;          // ms timestamp of last applied remote
-let suppressPushUntil = 0;     // prevents ping-pong after applying remote
-
-$('#volume').value = volume;
-audio.volume = volume;
-
-// ---------- Theme ----------
-const themeToggle = $('#themeToggle');
-(function () {
-  const pref = localStorage.getItem('theme') ||
-    (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  document.documentElement.classList.toggle('dark', pref === 'dark');
-})();
-themeToggle.addEventListener('click', () => {
-  const d = document.documentElement.classList.toggle('dark');
-  localStorage.setItem('theme', d ? 'dark' : 'light');
-});
-
-// ---------- Auth & presence ----------
-const me = await ensureAnonAuth();
-
-async function presenceHeartbeat() {
-  await supabase.from('presence').upsert({
-    uid: me.id,
-    display_name: shortAnon(me.id),
-    last_active_at: new Date()
-  });
-}
-setInterval(presenceHeartbeat, 30_000);
-presenceHeartbeat();
-
-async function updateOnlineCount() {
-  const since = new Date(Date.now() - 60_000).toISOString();
-  const { data } = await supabase
-    .from('presence')
-    .select('uid', { count: 'exact', head: false })
-    .gte('last_active_at', since);
-  $('#onlineCount').textContent = data?.length ?? 0;
-}
-setInterval(updateOnlineCount, 10_000);
-updateOnlineCount();
-
-// ---------- Host UI ----------
-const hostBtn   = $('#hostBtn');
-const hostBadge = $('#hostBadge');
-
-hostBtn.addEventListener('click', async () => {
-  if (hostUid === me.id) {
-    await releaseHost();
-  } else {
-    await becomeHost();
-  }
-});
-
-function updateHostUI() {
-  const isHost = hostUid === me.id;
-
-  // Badge shows current host (if any)
-  if (hostUid) {
-    hostBadge.classList.remove('hidden');
-    hostBadge.textContent = `Host: ${shortAnon(hostUid)}`;
-  } else {
-    hostBadge.classList.add('hidden');
-    hostBadge.textContent = 'Host: —';
-  }
-
-  // Button visibility/label
-  if (!hostUid) {
-    hostBtn.classList.remove('hidden');
-    hostBtn.textContent = 'Become host';
-  } else if (isHost) {
-    hostBtn.classList.remove('hidden');
-    hostBtn.textContent = 'Release host';
-  } else {
-    hostBtn.classList.add('hidden'); // someone else is host → hide
-  }
-}
-
-async function becomeHost() {
-  // Take host locally first to avoid race flicker
-  hostUid = me.id;
-  updateHostUI();
-  // Ignore older remote states during this brief window
-  lastRemoteAt = Date.now();
-  suppressPushUntil = Date.now() + 1500;
-
-  const { error } = await supabase.from('state').upsert({
-    id: 'global',
-    host_uid: me.id,
-    current_track_id: queue[currentIndex] || null,
-    position: audio.currentTime || 0,
-    is_playing: !audio.paused,
-    updated_at: new Date()
-  });
-  if (error) {
-    toast('Failed to become host', 'error');
-    hostUid = null;
-    updateHostUI();
-  } else {
-    toast('You are now the host.');
-  }
-}
-
-async function releaseHost() {
-  const { error } = await supabase.from('state').upsert({
-    id: 'global',
-    host_uid: null,
-    current_track_id: queue[currentIndex] || null,
-    position: audio.currentTime || 0,
-    is_playing: !audio.paused,
-    updated_at: new Date()
-  });
-  if (!error) {
-    hostUid = null;
-    updateHostUI();
-    toast('Host released.');
-  } else {
-    toast('Failed to release host', 'error');
-  }
-}
-
-// ---------- Upload handling ----------
-const dropzone  = $('#dropzone');
-const fileInput = $('#fileInput');
-const uploadBtn = $('#uploadBtn');
-if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput.click());
-
-dropzone.addEventListener('click', () => fileInput.click());
-['dragenter', 'dragover'].forEach((ev) =>
-  dropzone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    dropzone.classList.add('ring-2', 'ring-brand-500');
-  })
-);
-['dragleave', 'drop'].forEach((ev) =>
-  dropzone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    dropzone.classList.remove('ring-2', 'ring-brand-500');
-  })
-);
-dropzone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files));
-fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
-
-function validAudio(file) {
-  if (!file.type.startsWith('audio/')) throw new Error('Only audio files are allowed.');
-  if (file.size > MAX_BYTES) throw new Error(`File too large. Max ${MAX_MB} MB.`);
-}
-
-async function handleFiles(list) {
-  for (const f of Array.from(list)) {
-    try { await uploadFile(f); }
-    catch (e) { console.error(e); toast(e.message || 'Upload failed', 'error'); }
-  }
-}
-
-async function uploadFile(file) {
-  validAudio(file);
-
-  const row = document.createElement('div');
-  row.className =
-    'flex items-center gap-3 border rounded-xl p-3 bg-white/60 dark:bg-slate-900/60 border-slate-200 dark:border-slate-800';
-  row.innerHTML = `<div class="w-8 h-8 rounded-md bg-slate-200 dark:bg-slate-800 flex items-center justify-center"><i data-lucide="music" class="w-4 h-4"></i></div>
-  <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">${file.name}</div>
-  <div class="h-1 bg-slate-200 dark:bg-slate-800 rounded mt-2 overflow-hidden"><div class="h-full bg-brand-500 progress" style="width:20%"></div></div></div>
-  <div class="text-xs status">Uploading…</div>`;
-  $('#uploadList').prepend(row);
-  lucide.createIcons();
-
-  // --- NEW: get duration from local file first (robust, no CORS/race) ---
-  let duration = 0;
-  try {
-    duration = await calcDurationFromFile(file);
-  } catch { duration = 0; }
-
-  // Upload (path includes bucket 'uploads' implicitly via from('uploads'))
-  const path = `uploads/${me.id}/${Date.now()}-${file.name}`;
-  const { error } = await supabase.storage
-    .from('uploads')
-    .upload(path, file, { upsert: false, cacheControl: '3600' });
-  if (error) throw error;
-  row.querySelector('.progress').style.width = '70%';
-
-  // Public URL for playback
-  const { data: pub } = supabase.storage.from('uploads').getPublicUrl(path);
-  const downloadURL = pub.publicUrl;
-
-  const title = sanitizeTitle(file.name);
-  const { error: dberr } = await supabase.from('tracks').insert({
-    title,
-    artist: null,
-    storage_path: path,
-    download_url: downloadURL,
-    duration,
-    uploader_id: me.id,
-    uploaded_at: new Date(),
-    uploader_badge: shortAnon(me.id),
-  });
-  if (dberr) throw dberr;
-
-  row.querySelector('.progress').style.width = '100%';
-  row.querySelector('.status').textContent = 'Done';
-  toast('Uploaded: ' + file.name);
-
-  await initialLoad();            // refresh list
-  await repairZeroDurations();    // just in case
-}
-
-// Duration helpers (robust)
-function calcDurationFromFile(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    sniffDuration(url)
-      .then((d) => { URL.revokeObjectURL(url); resolve(d); })
-      .catch((e) => { URL.revokeObjectURL(url); reject(e); });
-  });
-}
-
-function sniffDuration(src) {
-  return new Promise((resolve, reject) => {
-    const a = new Audio();
-    let done = false;
-    const timeout = setTimeout(() => {
-      if (!done) { done = true; reject(new Error('duration timeout')); }
-    }, 6000);
-
-    function clean(ok, val) {
-      if (done) return;
-      done = true;
-      clearTimeout(timeout);
-      a.src = '';
-      ok ? resolve(Math.max(0, Math.round(val || 0))) : reject(val);
-    }
-
-    a.preload = 'metadata';
-    a.crossOrigin = 'anonymous';
-    a.src = src;
-
-    a.addEventListener('loadedmetadata', () => {
-      if (Number.isFinite(a.duration) && a.duration > 0) {
-        clean(true, a.duration);
-      } else {
-        const onTimeUpdate = () => {
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            a.removeEventListener('timeupdate', onTimeUpdate);
-            clean(true, a.duration);
-          }
-        };
-        a.addEventListener('timeupdate', onTimeUpdate);
-        try { a.currentTime = 1e7; } catch {}
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: { colors: { brand: { 500:'#06b6d4', 600:'#0891b2' } } }
       }
-    });
-
-    a.addEventListener('error', () => clean(false, new Error('audio error')));
-  });
-}
-
-// ---------- Library load & polling ----------
-async function initialLoad() {
-  const { data, error } = await supabase
-    .from('tracks')
-    .select('*')
-    .order('uploaded_at', { ascending: false })
-    .limit(200);
-  if (!error && data) {
-    library = data;
-    applySearchAndSort();
-  }
-}
-await initialLoad();
-setInterval(initialLoad, POLL_MS_TRACKS);
-
-// Try to repair any tracks that have duration == 0 on startup
-repairZeroDurations().catch(() => {});
-
-$('#sortSelect').addEventListener('change', applySearchAndSort);
-$('#search').addEventListener('input', applySearchAndSort);
-
-function applySearchAndSort() {
-  const q = $('#search').value.toLowerCase().trim();
-  filtered = library.filter(
-    (t) =>
-      (t.title  || '').toLowerCase().includes(q) ||
-      (t.artist || '').toLowerCase().includes(q)
-  );
-  const [field, dir] = $('#sortSelect').value.split('-');
-  filtered.sort((a, b) => {
-    const va = a[field] ?? '';
-    const vb = b[field] ?? '';
-    if (field === 'uploaded_at')
-      return dir === 'desc' ? new Date(vb) - new Date(va) : new Date(va) - new Date(vb);
-    return String(va).localeCompare(String(vb), undefined, { sensitivity: 'base' }) * (dir === 'asc' ? 1 : -1);
-  });
-  renderPlaylist();
-}
-
-function renderPlaylist() {
-  const list = $('#playlist');
-  list.innerHTML = '';
-  filtered.forEach((track) => {
-    const card = renderTrackCard(track, { onPlay: playFromLibrary, onDelete: confirmDelete });
-    list.appendChild(card);
-  });
-  lucide.createIcons();
-}
-
-async function confirmDelete(track) {
-  if (!confirm(`Delete "${track.title}"?`)) return;
-  await supabase.from('tracks').delete().eq('id', track.id);
-  await supabase.storage.from('uploads').remove([track.storage_path]).catch(() => {});
-  toast('Deleted');
-  await initialLoad();
-}
-
-// ---------- Player ----------
-const nowTitle = $('#nowTitle'),
-      nowArtist = $('#nowArtist'),
-      seek = $('#seek'),
-      timeCur = $('#timeCur'),
-      timeTotal = $('#timeTotal');
-const playPauseBtn = $('#playPauseBtn'),
-      prevBtn = $('#prevBtn'),
-      nextBtn = $('#nextBtn'),
-      shuffleBtn = $('#shuffleBtn'),
-      repeatBtn  = $('#repeatBtn'),
-      volumeSlider = $('#volume');
-
-function loadQueue() {
-  try {
-    queue = JSON.parse(localStorage.getItem('smp_queue') || '[]');
-    currentIndex = Number(localStorage.getItem('smp_index') || -1);
-  } catch { queue = []; currentIndex = -1; }
-}
-function saveQueue() {
-  localStorage.setItem('smp_queue', JSON.stringify(queue));
-  localStorage.setItem('smp_index', String(currentIndex));
-}
-loadQueue();
-
-function trackById(id) { return library.find((t) => t.id === id); }
-
-function playFromLibrary(track) {
-  const ids = filtered.map((t) => t.id);
-  const idx = ids.indexOf(track.id);
-  if (shuffle) { queue = shuffleArray(ids); currentIndex = queue.indexOf(track.id); }
-  else { queue = ids; currentIndex = idx; }
-  startPlayback(track);
-  saveQueue();
-}
-
-async function safePlay() {
-  try { await audio.play(); }
-  catch { toast('Press Play to start audio (autoplay blocked)', 'error'); }
-}
-
-function startPlayback(track) {
-  if (!track) return;
-  audio.src = track.download_url;
-  safePlay();
-  nowTitle.textContent  = track.title  || '(untitled)';
-  nowArtist.textContent = track.artist || '';
-  timeTotal.textContent = formatTime(track.duration || 0);
-  setPlayPauseIcon('pause');
-  pushSyncStateSoon();
-}
-
-function setPlayPauseIcon(state) {
-  const icon = playPauseBtn.querySelector('svg');
-  icon.parentNode.innerHTML =
-    state === 'pause' ? '<i data-lucide="pause" class="w-6 h-6"></i>' :
-                        '<i data-lucide="play"  class="w-6 h-6"></i>';
-  lucide.createIcons();
-}
-
-function next() {
-  if (!queue.length) return;
-  if (repeat) { /* same track */ }
-  else if (shuffle) { currentIndex = Math.floor(Math.random() * queue.length); }
-  else { currentIndex = (currentIndex + 1) % queue.length; }
-  startPlayback(trackById(queue[currentIndex]));
-  saveQueue();
-}
-function prev() {
-  if (!queue.length) return;
-  if (audio.currentTime > 3) { audio.currentTime = 0; return; }
-  if (shuffle) currentIndex = Math.floor(Math.random() * queue.length);
-  else currentIndex = (currentIndex - 1 + queue.length) % queue.length;
-  startPlayback(trackById(queue[currentIndex]));
-  saveQueue();
-}
-
-playPauseBtn.addEventListener('click', () => {
-  if (audio.paused) { safePlay(); setPlayPauseIcon('pause'); }
-  else { audio.pause(); setPlayPauseIcon('play'); }
-  pushSyncStateSoon();
-});
-nextBtn.addEventListener('click', next);
-prevBtn.addEventListener('click', prev);
-shuffleBtn.addEventListener('click', () => {
-  shuffle = !shuffle; localStorage.setItem('smp_shuffle', JSON.stringify(shuffle));
-  toast('Shuffle ' + (shuffle ? 'on' : 'off'));
-});
-repeatBtn.addEventListener('click', () => {
-  repeat = !repeat; localStorage.setItem('smp_repeat', JSON.stringify(repeat));
-  toast('Repeat ' + (repeat ? 'on' : 'off'));
-});
-volumeSlider.addEventListener('input', (e) => {
-  audio.volume = Number(e.target.value);
-  localStorage.setItem('smp_volume', String(audio.volume));
-});
-
-seek.addEventListener('input', () => {
-  if (audio.duration) audio.currentTime = (seek.value / 100) * audio.duration;
-  pushSyncStateSoon();
-});
-
-audio.addEventListener('timeupdate', () => {
-  if (!audio.duration) return;
-  seek.value = String((audio.currentTime / audio.duration) * 100);
-  timeCur.textContent = formatTime(audio.currentTime);
-  if (!audio.paused) throttledPush();
-});
-audio.addEventListener('ended', () => {
-  if (repeat) { audio.currentTime = 0; safePlay(); }
-  else next();
-});
-
-// Keyboard shortcuts
-document.addEventListener('keydown', (e) => {
-  if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
-  if (e.code === 'Space') { e.preventDefault(); playPauseBtn.click(); }
-  if (e.key === 'j' || e.key === 'J') prev();
-  if (e.key === 'k' || e.key === 'K') next();
-});
-
-function shuffleArray(arr) { return arr.map((v) => [Math.random(), v]).sort((a, b) => a[0]-b[0]).map((x)=>x[1]); }
-
-// ---------- Shared Sync with strict Host Lock ----------
-async function pollState() {
-  if (!followSync) return;
-  const { data, error } = await supabase
-    .from('state')
-    .select('*')
-    .eq('id', 'global')
-    .maybeSingle();
-  if (error || !data) return;
-  applyRemoteState(data);
-}
-setInterval(pollState, POLL_MS_STATE);
-pollState();
-
-// Realtime (optional; harmless if disabled)
-try {
-  supabase
-    .channel('realtime:state')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'state', filter: 'id=eq.global' },
-      payload => applyRemoteState(payload.new || payload.old || {}))
-    .subscribe();
-} catch {}
-
-function applyRemoteState(s) {
-  // 1) Update host from DB
-  hostUid = s.host_uid ?? null;
-  updateHostUI();
-
-  // 2) Ignore older states
-  const ts = s.updated_at ? new Date(s.updated_at).getTime() : 0;
-  if (ts && ts <= lastRemoteAt) return;
-  lastRemoteAt = ts || Date.now();
-
-  // 3) If I'm host, ignore remote (my client is source of truth)
-  if (hostUid === me.id) return;
-
-  // 4) Follow host if a track is chosen
-  if (!s.current_track_id) return;
-  const t = library.find(x => x.id === s.current_track_id);
-  if (!t) return;
-
-  const differentTrack = !queue.length || queue[currentIndex] !== t.id;
-  if (differentTrack) {
-    queue = [t.id]; currentIndex = 0; saveQueue();
-    audio.src = t.download_url;
-    nowTitle.textContent = t.title || '(untitled)';
-    nowArtist.textContent = t.artist || '';
-    timeTotal.textContent = formatTime(t.duration || 0);
-  }
-
-  if (typeof s.position === 'number' && audio.duration) {
-    if (Math.abs((audio.currentTime || 0) - s.position) > 0.8) {
-      suppressPushUntil = Date.now() + 1200;
-      audio.currentTime = s.position;
     }
-  }
+  </script>
 
-  if (s.is_playing) { safePlay(); } else { audio.pause(); }
-}
+  <!-- Lucide icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
 
-function nowState() {
-  return {
-    id: 'global',
-    host_uid: hostUid || null,
-    current_track_id: queue[currentIndex] || null,
-    position: audio.currentTime || 0,
-    is_playing: !audio.paused,
-    updated_at: new Date()
-  };
-}
+  <!-- Supabase JS SDK v2 via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
-const pushSyncStateSoon = debounce(pushState, 250);
-let lastThrottled = 0;
-async function throttledPush() {
-  const now = Date.now();
-  if (now - lastThrottled > 2000) { lastThrottled = now; pushState(); }
-}
+  <link rel="stylesheet" href="assets/app.css" />
+</head>
+<body class="h-full bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+  <div id="app" class="min-h-full pb-28">
+    <!-- Header -->
+    <header class="sticky top-0 z-30 backdrop-blur bg-white/70 dark:bg-slate-950/70 border-b border-slate-200 dark:border-slate-800">
+      <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg bg-brand-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          </div>
+          <h1 class="font-semibold text-lg">Shared Music Player</h1>
+        </div>
 
-async function pushState() {
-  if (!followSync) return;
-  if (hostUid !== me.id) return;               // only host writes
-  if (Date.now() < suppressPushUntil) return;  // don't echo right after remote apply
-  await supabase.from('state').upsert(nowState());
-}
+        <div class="ml-auto flex items-center gap-2 w-full max-w-xl">
+          <div class="relative flex-1">
+            <input id="search" type="search" placeholder="Search title or artist…" class="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white/70 dark:bg-slate-900/70 px-10 py-2 outline-none focus:ring-2 focus:ring-brand-500" />
+            <div class="absolute left-3 top-1/2 -translate-y-1/2 opacity-60"><i data-lucide="search" class="w-4 h-4"></i></div>
+          </div>
 
-function debounce(fn, ms) { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; }
+          <button id="themeToggle" class="p-2 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800" title="Toggle theme">
+            <i data-lucide="sun" class="w-4 h-4 hidden dark:inline"></i>
+            <i data-lucide="moon" class="w-4 h-4 dark:hidden"></i>
+          </button>
 
-// ---------- Repair zero-duration tracks (for older rows) ----------
-async function repairZeroDurations() {
-  const broken = (library || []).filter(t => !t.duration || t.duration <= 0);
-  for (const t of broken) {
-    try {
-      const d = await sniffDuration(t.download_url);
-      if (d > 0) {
-        await supabase.from('tracks').update({ duration: d }).eq('id', t.id);
-        const idx = library.findIndex(x => x.id === t.id);
-        if (idx >= 0) library[idx].duration = d;
-      }
-    } catch { /* ignore */ }
-  }
-  applySearchAndSort();
-}
+          <div class="text-xs px-2 py-1 rounded-lg border border-slate-300 dark:border-slate-700" title="Listeners online">
+            <span id="onlineCount">0</span> online
+          </div>
 
-// ---------- Restore previous queue UI ----------
-(function () {
-  if (!queue.length) return;
-  const cur = trackById(queue[currentIndex]);
-  if (cur) {
-    audio.src = cur.download_url;
-    nowTitle.textContent = cur.title || '(untitled)';
-    nowArtist.textContent = cur.artist || '';
-    timeTotal.textContent = formatTime(cur.duration || 0);
-  }
-})();
+          <!-- Host controls -->
+          <div class="flex items-center gap-2 ml-2">
+            <span id="hostBadge" class="hidden text-xs px-2 py-1 rounded-lg border border-emerald-500 text-emerald-700 dark:text-emerald-300">Host: —</span>
+            <button id="hostBtn" class="px-3 py-1.5 text-sm rounded-lg bg-brand-500 hover:bg-brand-600 text-white">Become host</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Upload area -->
+    <section class="max-w-6xl mx-auto px-4 py-4">
+      <div id="dropzone" class="group border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer bg-slate-50 dark:bg-slate-900 border-slate-300 dark:border-slate-700 hover:border-brand-500">
+        <div class="flex flex-col items-center gap-2">
+          <i data-lucide="upload" class="w-6 h-6 opacity-70"></i>
+          <p class="text-sm">Drag & drop audio files here</p>
+          <p class="text-xs opacity-70">or use the button below (.mp3, .wav, .m4a, .ogg — max <span id="maxSizeLabel">20</span> MB)</p>
+        </div>
+        <input id="fileInput" type="file" accept="audio/*" multiple class="hidden" />
+      </div>
+      <button id="uploadBtn" class="mt-3 w-full sm:w-auto px-4 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-white font-medium">Select Files</button>
+      <div id="uploadList" class="mt-3 space-y-2"></div>
+
+      <!-- Sort controls -->
+      <div class="mt-6 flex items-center gap-2 flex-wrap">
+        <label class="text-sm opacity-70">Sort:</label>
+        <select id="sortSelect" class="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-sm">
+          <option value="uploaded_at-desc">Newest</option>
+          <option value="title-asc">Title (A–Z)</option>
+          <option value="artist-asc">Artist (A–Z)</option>
+        </select>
+      </div>
+    </section>
+
+    <!-- Playlist -->
+    <main class="max-w-6xl mx-auto px-4 pb-24">
+      <div id="playlist" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <template id="trackCardTpl">
+        <div class="track-card group border rounded-xl p-3 hover:border-brand-500 border-slate-200 dark:border-slate-800 bg-white/60 dark:bg-slate-900/60">
+          <div class="flex items-center gap-3">
+            <button class="playBtn shrink-0 w-10 h-10 rounded-lg bg-slate-200 dark:bg-slate-800 flex items-center justify-center hover:bg-brand-500 hover:text-white" title="Play">
+              <i data-lucide="play" class="w-5 h-5"></i>
+            </button>
+            <div class="min-w-0 flex-1">
+              <div class="truncate font-medium title"></div>
+              <div class="truncate text-sm opacity-70 artist"></div>
+              <div class="text-xs mt-1 opacity-70">
+                <span class="duration"></span> · <span class="uploader"></span> · <span class="uploadedAt"></span>
+              </div>
+            </div>
+            <div class="relative">
+              <button class="menuBtn p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800"><i data-lucide="more-horizontal" class="w-4 h-4"></i></button>
+              <div class="menu hidden absolute right-0 mt-1 w-36 border rounded-lg bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 shadow-lg">
+                <button class="deleteBtn w-full text-left px-3 py-2 text-sm hover:bg-red-50 dark:hover:bg-red-950">Delete</button>
+                <a class="downloadLink block px-3 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-800" target="_blank">Download</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </main>
+  </div>
+
+  <!-- Sticky player bar -->
+  <div id="playerBar" class="fixed bottom-0 inset-x-0 z-40 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-950/95 backdrop-blur">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+      <div class="w-12 h-12 rounded-lg bg-slate-200 dark:bg-slate-800 flex items-center justify-center shrink-0"><i data-lucide="music" class="w-5 h-5 opacity-60"></i></div>
+      <div class="min-w-0 flex-1">
+        <div class="truncate font-medium" id="nowTitle">Nothing playing</div>
+        <div class="truncate text-sm opacity-70" id="nowArtist"></div>
+        <div class="flex items-center gap-2 mt-1">
+          <input id="seek" type="range" min="0" max="100" value="0" class="w-full">
+          <div class="text-xs w-24 text-right"><span id="timeCur">0:00</span> / <span id="timeTotal">0:00</span></div>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="prevBtn" class="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800" title="Previous"><i data-lucide="skip-back" class="w-5 h-5"></i></button>
+        <button id="playPauseBtn" class="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800" title="Play/Pause"><i data-lucide="play" class="w-6 h-6"></i></button>
+        <button id="nextBtn" class="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800" title="Next"><i data-lucide="skip-forward" class="w-5 h-5"></i></button>
+        <button id="shuffleBtn" class="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800" title="Shuffle"><i data-lucide="shuffle" class="w-5 h-5"></i></button>
+        <button id="repeatBtn" class="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800" title="Repeat"><i data-lucide="repeat" class="w-5 h-5"></i></button>
+        <div class="flex items-center gap-2 ml-2">
+          <i data-lucide="volume-2" class="w-4 h-4 opacity-70"></i>
+          <input id="volume" type="range" min="0" max="1" step="0.01" class="w-28" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <audio id="audio" crossorigin="anonymous"></audio>
+
+  <!-- App scripts -->
+  <script type="module" src="assets/supabase.js"></script>
+  <script type="module" src="assets/ui.js"></script>
+  <script type="module" src="assets/app.js"></script>
+  <script>lucide.createIcons();</script>
+</body>
+</html>
