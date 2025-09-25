@@ -14,9 +14,13 @@ let queue = [];
 let currentIndex = -1;
 
 let shuffle = JSON.parse(localStorage.getItem('smp_shuffle') || 'false');
-let repeat  = JSON.parse(localStorage.getItem('smp_repeat') || 'false');
-let volume  = Number(localStorage.getItem('smp_volume')  || '0.9');
-let followSync = true; // Always ON
+let repeat  = JSON.parse(localStorage.getItem('smp_repeat')  || 'false');
+let volume  = Number(localStorage.getItem('smp_volume')      || '0.9');
+
+let followSync = true;                // always ON
+let hostUid = null;                   // current host (from DB)
+let lastRemoteAt = 0;                 // ms timestamp of last applied remote
+let suppressPushUntil = 0;            // prevents ping-pong after applying remote
 
 $('#volume').value = volume;
 audio.volume = volume;
@@ -57,10 +61,68 @@ async function updateOnlineCount() {
 setInterval(updateOnlineCount, 10_000);
 updateOnlineCount();
 
+// ---------- Host UI ----------
+const hostBtn   = $('#hostBtn');
+const hostBadge = $('#hostBadge');
+
+hostBtn.addEventListener('click', async () => {
+  await becomeHost();
+});
+
+function updateHostUI() {
+  const isHost = hostUid === me.id;
+  if (isHost) {
+    hostBtn.textContent = 'Release host';
+    hostBtn.onclick = async () => { await releaseHost(); };
+    hostBadge.classList.remove('hidden');
+    hostBadge.textContent = `Host: ${shortAnon(me.id)}`;
+    hostBadge.classList.add('border-emerald-500');
+  } else {
+    hostBtn.textContent = 'Become host';
+    hostBtn.onclick = async () => { await becomeHost(); };
+    hostBadge.classList.toggle('hidden', !hostUid);
+    if (hostUid) {
+      hostBadge.textContent = `Host: ${shortAnon(hostUid)}`;
+      hostBadge.classList.add('border-emerald-500');
+    }
+  }
+}
+
+async function becomeHost() {
+  // Host takes over and writes the current state
+  await supabase.from('state').upsert({
+    id: 'global',
+    host_uid: me.id,
+    current_track_id: queue[currentIndex] || null,
+    position: audio.currentTime || 0,
+    is_playing: !audio.paused,
+    updated_at: new Date(),
+    updated_by: me.id,
+  });
+  hostUid = me.id;
+  updateHostUI();
+  toast('You are now the host.');
+}
+
+async function releaseHost() {
+  await supabase.from('state').upsert({
+    id: 'global',
+    host_uid: null,
+    current_track_id: queue[currentIndex] || null,
+    position: audio.currentTime || 0,
+    is_playing: !audio.paused,
+    updated_at: new Date(),
+    updated_by: me.id,
+  });
+  hostUid = null;
+  updateHostUI();
+  toast('Host released.');
+}
+
 // ---------- Upload handling ----------
 const dropzone  = $('#dropzone');
 const fileInput = $('#fileInput');
-const uploadBtn = document.getElementById('uploadBtn');
+const uploadBtn = $('#uploadBtn');
 if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput.click());
 
 dropzone.addEventListener('click', () => fileInput.click());
@@ -251,7 +313,7 @@ function startPlayback(track) {
   if (!track) return;
   audio.src = track.download_url;
   safePlay();
-  nowTitle.textContent = track.title  || '(untitled)';
+  nowTitle.textContent  = track.title  || '(untitled)';
   nowArtist.textContent = track.artist || '';
   timeTotal.textContent = formatTime(track.duration || 0);
   setPlayPauseIcon('pause');
@@ -329,11 +391,7 @@ document.addEventListener('keydown', (e) => {
 
 function shuffleArray(arr) { return arr.map((v) => [Math.random(), v]).sort((a, b) => a[0]-b[0]).map((x)=>x[1]); }
 
-// ---------- Shared Sync (robust) ----------
-let suppressPushUntil = 0;
-let lastRemoteAt = 0;   // ms timestamp of latest remote state we've applied
-let lastLocalAt  = 0;   // ms timestamp of our last local push
-
+// ---------- Shared Sync with Host Lock ----------
 async function pollState() {
   if (!followSync) return;
   const { data, error } = await supabase.from('state').select('*').eq('id', 'global').maybeSingle();
@@ -343,68 +401,70 @@ async function pollState() {
 setInterval(pollState, 1000);
 pollState();
 
-// If Realtime later enabled, this helps; otherwise it's harmless
+// Realtime (optional; harmless if disabled)
 try {
   supabase
     .channel('realtime:state')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'state', filter: 'id=eq.global' },
-      payload => { applyRemoteState(payload.new || payload.old || {}); })
+      payload => applyRemoteState(payload.new || payload.old || {}))
     .subscribe();
 } catch {}
 
 function applyRemoteState(s) {
-  if (!s) return;
-
-  // Ignore our own updates to prevent ping-pong
-  if (s.updated_by && s.updated_by === me.id) return;
+  // Update host first
+  hostUid = s.host_uid ?? null;
+  updateHostUI();
 
   const ts = s.updated_at ? new Date(s.updated_at).getTime() : 0;
-  if (ts && ts <= lastRemoteAt) return; // older or same as what we already applied
+  if (ts && ts <= lastRemoteAt) return; // old state
   lastRemoteAt = ts || Date.now();
 
-  // Prevent immediate push-back loop
-  suppressPushUntil = Date.now() + 1200;
+  // If I'm host, ignore remote (I am source of truth)
+  if (hostUid === me.id) return;
 
-  // If no current track, don't do anything
+  // If no track selected yet
   if (!s.current_track_id) return;
 
   const t = library.find(x => x.id === s.current_track_id);
   if (!t) return;
 
-  // Ensure our queue/track matches
+  // Follow track
   const differentTrack = !queue.length || queue[currentIndex] !== t.id;
   if (differentTrack) {
     queue = [t.id]; currentIndex = 0; saveQueue();
-    // Don't push here; startPlayback will push, but suppressed by suppressPushUntil
     audio.src = t.download_url;
     nowTitle.textContent = t.title || '(untitled)';
     nowArtist.textContent = t.artist || '';
     timeTotal.textContent = formatTime(t.duration || 0);
   }
 
-  // Seek if drifted
+  // Follow position
   if (typeof s.position === 'number' && audio.duration) {
     if (Math.abs((audio.currentTime || 0) - s.position) > 0.8) {
+      suppressPushUntil = Date.now() + 1200;
       audio.currentTime = s.position;
     }
   }
 
   // Follow play/pause
-  if (s.is_playing) safePlay();
-  else audio.pause();
+  if (s.is_playing) { safePlay(); }
+  else { audio.pause(); }
 }
 
 function nowState() {
   return {
     id: 'global',
+    host_uid: hostUid || null,
     current_track_id: queue[currentIndex] || null,
     position: audio.currentTime || 0,
     is_playing: !audio.paused,
     updated_at: new Date(),
-    updated_by: me.id, // <--- key to avoid fighting ourselves
+    updated_by: me.id,
   };
 }
 
+// Only the host is allowed to push when a host exists.
+// If no host yet, anyone can become source (until someone clicks "Become host").
 const pushSyncStateSoon = debounce(pushState, 250);
 let lastThrottled = 0;
 async function throttledPush() {
@@ -414,14 +474,19 @@ async function throttledPush() {
 
 async function pushState() {
   if (!followSync) return;
-  if (Date.now() < suppressPushUntil) return; // we just applied remote; don't push
-  lastLocalAt = Date.now();
+
+  // Respect host lock: if a host is set and it's not me, I do not write
+  if (hostUid && hostUid !== me.id) return;
+
+  // Avoid immediate push after applying remote
+  if (Date.now() < suppressPushUntil) return;
+
   await supabase.from('state').upsert(nowState());
 }
 
 function debounce(fn, ms) { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; }
 
-// ---------- Restore previous queue ----------
+// ---------- Restore previous queue UI ----------
 (function () {
   if (!queue.length) return;
   const cur = trackById(queue[currentIndex]);
