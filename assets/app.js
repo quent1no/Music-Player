@@ -4,6 +4,8 @@ import { $, $$, toast, renderTrackCard, formatTime, sanitizeTitle } from './ui.j
 // ---------- Config ----------
 const MAX_MB = 20;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const POLL_MS_TRACKS = 5000;
+const POLL_MS_STATE = 1000;
 $('#maxSizeLabel').textContent = String(MAX_MB);
 
 // ---------- State ----------
@@ -20,7 +22,7 @@ let volume  = Number(localStorage.getItem('smp_volume')      || '0.9');
 let followSync = true;         // always ON
 let hostUid = null;            // current host (from DB)
 let lastRemoteAt = 0;          // ms timestamp of last applied remote
-let suppressPushUntil = 0;     // prevents ping-pong immediately after applying remote
+let suppressPushUntil = 0;     // prevents ping-pong after applying remote
 
 $('#volume').value = volume;
 audio.volume = volume;
@@ -75,7 +77,8 @@ hostBtn.addEventListener('click', async () => {
 
 function updateHostUI() {
   const isHost = hostUid === me.id;
-  hostBtn.textContent = isHost ? 'Release host' : 'Become host';
+
+  // Badge shows current host (if any)
   if (hostUid) {
     hostBadge.classList.remove('hidden');
     hostBadge.textContent = `Host: ${shortAnon(hostUid)}`;
@@ -83,13 +86,24 @@ function updateHostUI() {
     hostBadge.classList.add('hidden');
     hostBadge.textContent = 'Host: —';
   }
+
+  // Button visibility/label
+  if (!hostUid) {
+    hostBtn.classList.remove('hidden');
+    hostBtn.textContent = 'Become host';
+  } else if (isHost) {
+    hostBtn.classList.remove('hidden');
+    hostBtn.textContent = 'Release host';
+  } else {
+    hostBtn.classList.add('hidden'); // someone else is host → hide
+  }
 }
 
 async function becomeHost() {
   // Take host locally first to avoid race flicker
   hostUid = me.id;
   updateHostUI();
-  // Ignore any older remote states during this brief window
+  // Ignore older remote states during this brief window
   lastRemoteAt = Date.now();
   suppressPushUntil = Date.now() + 1500;
 
@@ -103,7 +117,6 @@ async function becomeHost() {
   });
   if (error) {
     toast('Failed to become host', 'error');
-    // roll back if write failed
     hostUid = null;
     updateHostUI();
   } else {
@@ -237,7 +250,7 @@ async function initialLoad() {
   }
 }
 await initialLoad();
-setInterval(initialLoad, 5000);
+setInterval(initialLoad, POLL_MS_TRACKS);
 
 $('#sortSelect').addEventListener('change', applySearchAndSort);
 $('#search').addEventListener('input', applySearchAndSort);
@@ -404,11 +417,15 @@ function shuffleArray(arr) { return arr.map((v) => [Math.random(), v]).sort((a, 
 // ---------- Shared Sync with strict Host Lock ----------
 async function pollState() {
   if (!followSync) return;
-  const { data, error } = await supabase.from('state').select('*').eq('id', 'global').maybeSingle();
+  const { data, error } = await supabase
+    .from('state')
+    .select('*')
+    .eq('id', 'global')
+    .maybeSingle();
   if (error || !data) return;
   applyRemoteState(data);
 }
-setInterval(pollState, 1000);
+setInterval(pollState, POLL_MS_STATE);
 pollState();
 
 // Realtime (optional; harmless if disabled)
@@ -468,7 +485,6 @@ function nowState() {
   };
 }
 
-// 🛡️ Only host writes. Non-hosts NEVER write.
 const pushSyncStateSoon = debounce(pushState, 250);
 let lastThrottled = 0;
 async function throttledPush() {
